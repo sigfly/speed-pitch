@@ -99,8 +99,10 @@ function readSettings() {
   $('volumeOut').value = settings.volume+'%';
   if (oscillator) oscillator.type = settings.wave;
 }
-let context, oscillator, gain, master, running=false, mode='motion', busy=false, session=0;
+let context, oscillator, gain, running=false, mode='motion', busy=false, session=0;
+const QUIET_MS=70, STABLE_MS=65, STALE_MS=150;
 let lastSample=0, latestSample=0, lastActivity=0, calibrationUntil=0;
+let stableSince=0, stableAnchor=null;
 let velocity=[0,0,0], gravity=null, bias=[0,0,0], level=0, active=false, source=null;
 let demoSpeed=0, frameTime=0;
 function pitchFor(speed, deadband, sensitivity, low, high) {
@@ -110,7 +112,8 @@ function pitchFor(speed, deadband, sensitivity, low, high) {
 function clearMotion(now, calibrate=false) {
   velocity=[0,0,0]; gravity=null; bias=[0,0,0]; level=0; active=false;
   lastSample=0; latestSample=0; lastActivity=now; source=null;
-  calibrationUntil=calibrate ? now+650 : 0;
+  stableSince=0; stableAnchor=null;
+  calibrationUntil=calibrate ? now+300 : 0;
 }
 function motion(event) {
   if (!running || mode!=='motion' || document.hidden) return;
@@ -123,7 +126,9 @@ function motion(event) {
   source=nextSource;
   latestSample=now;
   const dt=lastSample ? clamp((now-lastSample)/1000,.005,.055) : .016;
-  if (lastSample && now-lastSample>250) { velocity=[0,0,0]; level=0; gravity=null; }
+  if (lastSample && now-lastSample>STALE_MS) {
+    velocity=[0,0,0]; level=0; gravity=null; stableAnchor=null; stableSince=0;
+  }
   lastSample=now;
   let acceleration=direct;
   if (!direct) {
@@ -140,32 +145,50 @@ function motion(event) {
   const force=magnitude(corrected);
   const turn=event.rotationRate;
   const rotation=turn ? Math.hypot(...[turn.alpha,turn.beta,turn.gamma].map(v=>Number.isFinite(v)?v:0)) : 0;
-  // Detect quiet samples independently of integrated speed so drift cannot sustain a tone.
-  const moving=force>0.24 || rotation>12;
+  // A phone put down in a new orientation can leave a large gravity-filter
+  // residual. Detect a stable raw gravity vector independently of that residual.
+  const nearGravity=raw && Math.abs(magnitude(raw)-9.81)<.65;
+  const stableVector=raw || direct;
+  const stableCandidate=rotation<8 && (raw ? nearGravity && (!direct || force<1.2) : force<.55);
+  if (!stableCandidate) {
+    stableAnchor=null; stableSince=0;
+  } else if (!stableAnchor || magnitude(stableVector.map((v,i)=>v-stableAnchor[i]))>.22) {
+    stableAnchor=stableVector.slice(); stableSince=now;
+  }
+  const settled=stableCandidate && now-stableSince>=STABLE_MS;
+  const moving=!settled && (force>.24 || rotation>10);
   if (moving) lastActivity=now;
-  if (now-lastActivity>180) {
+  if (settled || now-lastActivity>=QUIET_MS) {
     velocity=[0,0,0]; level=0; active=false;
-    if (force<.35) bias=bias.map((b,i)=>blend(b,acceleration[i],.012));
+    if (!direct && raw) { gravity=raw.slice(); bias=[0,0,0]; }
+    else if (force<.35 || settled) bias=bias.map((b,i)=>blend(b,acceleration[i],.12));
+    setAudio(0,false,false);
     return;
   }
-  const decay=Math.exp(-dt/0.55);
+  const decay=Math.exp(-dt/.30);
   velocity=velocity.map((v,i)=>clamp(v*decay+corrected[i]*dt,-5,5));
   // Rotation contributes a small equivalent speed (as if moving a hand-sized radius).
-  const estimate=Math.max(magnitude(velocity), Math.min(rotation,720)*Math.PI/180*.12);
+  // A short acceleration-based onset estimate avoids waiting for integration
+  // to accumulate enough velocity to cross the deadband.
+  const onset=moving ? Math.max(0,force-.24)*.10 : 0;
+  const estimate=Math.max(magnitude(velocity), onset, Math.min(rotation,720)*Math.PI/180*.12);
   const target=clamp(estimate,0,6);
-  level=blend(level,target,1-Math.exp(-dt/(target>level?.055:.10)));
+  level=target>level ? target : blend(level,target,1-Math.exp(-dt/.025));
+  // Update sound at sensor cadence, independent of display refresh.
+  setAudio(level,true,false);
 }
-function setAudio(speed, enabled) {
+function setAudio(speed, enabled, render=true) {
   const dead=Number(settings.deadband);
   active=enabled && (active ? speed>dead*.72 : speed>dead);
   const {amount,frequency}=pitchFor(speed,dead,Number(settings.sensitivity),Number(settings.low),Number(settings.high));
   const audible=active && Number(settings.volume)>0;
   if (context && gain && oscillator) {
     const t=context.currentTime;
-    oscillator.frequency.setTargetAtTime(frequency,t,.035);
-    const envelope=clamp((speed-dead*.72)/.12,0,1);
-    gain.gain.setTargetAtTime(audible ? .28*Number(settings.volume)/100*envelope : 0,t,audible?.018:.022);
+    oscillator.frequency.setTargetAtTime(frequency,t,.008);
+    const envelope=clamp((speed-dead*.72)/.06,0,1);
+    gain.gain.setTargetAtTime(audible ? .28*Number(settings.volume)/100*envelope : 0,t,.005);
   }
+  if (!render) return;
   $('pitch').textContent=audible ? Math.round(frequency) : '—';
   $('arc').style.strokeDasharray=(audible?amount*597:0)+' 597';
   $('bar').style.width=(enabled?clamp(speed/2.4*Number(settings.sensitivity),0,1)*100:0)+'%';
@@ -173,9 +196,9 @@ function setAudio(speed, enabled) {
   $('state').textContent=!running?'Ready to play':audible?'Motion · sounding':Number(settings.volume)===0?'Volume muted':mode==='motion'&&performance.now()<calibrationUntil?'Calibrating…':'Still · silent';
 }
 function tick(now) {
-  if (now-frameTime>25) {
+  if (now-frameTime>15) {
     frameTime=now;
-    const fresh=latestSample && now-latestSample<350 && now-lastActivity<180 && now>=calibrationUntil;
+    const fresh=latestSample && now-latestSample<STALE_MS && now-lastActivity<QUIET_MS && now>=calibrationUntil;
     setAudio(mode==='demo'?demoSpeed:fresh?level:0,running&&!document.hidden);
     if (running && mode==='motion' && now>calibrationUntil+1700 && (!latestSample || now-latestSample>1700)) {
       $('message').textContent='No usable motion data. Allow sensors in browser settings, use HTTPS, or try Test tone.';
@@ -200,10 +223,10 @@ async function start(nextMode) {
     if (nextMode==='motion' && !window.DeviceMotionEvent) throw Error('Motion sensors are unavailable. Try Test tone.');
     // Resume audio and request permission within the same user gesture.
     if (!context || context.state==='closed') {
-      context=new Audio();
-      oscillator=context.createOscillator(); gain=context.createGain(); master=context.createDynamicsCompressor();
+      context=new Audio({latencyHint:'interactive'});
+      oscillator=context.createOscillator(); gain=context.createGain();
       oscillator.type=settings.wave; oscillator.frequency.value=Number(settings.low);
-      gain.gain.value=0; oscillator.connect(gain).connect(master).connect(context.destination); oscillator.start();
+      gain.gain.value=0; oscillator.connect(gain).connect(context.destination); oscillator.start();
     }
     const resumed=context.resume();
     const permission=nextMode==='motion' && typeof DeviceMotionEvent.requestPermission==='function'
